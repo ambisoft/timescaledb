@@ -308,3 +308,73 @@ BEGIN
     PERFORM _timescaledb_internal.attach_tablespace(hypertable_id, tablespace);
 END
 $BODY$;
+
+
+
+
+--reindex only some chunks of a hypertable
+--regclass_oid is the hypertable regclass or a hypertable index regclass
+--verbose is a flag to indicate whether to output a notice for each index processed
+--recreate is a flag to force a CREATE INDEX followed by a DROP INDEX instead of a REINDEX.
+--time_column the name of the time column.
+--from_time is a lower bound for the time filter on a chunk
+--to_time is a upper bound for the time filter on a chunk
+----A reindex locks out reads during the procedure if those reads use the index.
+----A recreate does not lock reads but may use more disk space.
+CREATE OR REPLACE FUNCTION reindex(
+    regclass_oid REGCLASS,
+    verbose   BOOLEAN = FALSE,
+    recreate  BOOLEAN = FALSE,
+    time_column NAME = NULL,
+    from_time anyelement = NULL::bigint,
+    to_time   anyelement = NULL
+)
+    RETURNS VOID LANGUAGE PLPGSQL VOLATILE AS
+$BODY$
+DECLARE
+    hypertable_row _timescaledb_catalog.hypertable;
+    time_dimension_row _timescaledb_catalog.dimension;
+    index_oids OID[];
+    class_row pg_class;
+    main_table OID;
+    index_oid OID;
+BEGIN
+    SELECT * INTO STRICT class_row FROM pg_class WHERE OID = regclass_oid;
+
+    IF class_row.relkind = 'r' THEN
+        main_table = regclass_oid;
+        index_oid = NULL;
+    ELSIF class_row.relkind = 'i' THEN
+        SELECT indrelid INTO STRICT main_table FROM pg_index WHERE indexrelid = regclass_oid;
+        index_oid = regclass_oid;
+    ELSE 
+        RAISE 'Can only reindex hypertables or hypertable indexes using this function';
+    END IF;
+    
+    hypertable_row := _timescaledb_internal.hypertable_from_main_table(main_table);
+
+    WITH chunks AS (
+        SELECT *
+        FROM _timescaledb_internal.get_chunks(hypertable_row.id, time_column, from_time, to_time)
+    ),
+    hypertable_idx AS (
+        SELECT relname AS name
+        FROM pg_index i
+        INNER JOIN pg_class c ON (c.OID = i.indexrelid)
+        WHERE indrelid = main_table
+        AND (i.indexrelid = index_oid OR index_oid IS NULL)
+    )
+    SELECT ARRAY(SELECT index_class.oid
+    FROM  hypertable_idx hi, chunks c
+    INNER JOIN _timescaledb_catalog.chunk_index ci ON (ci.chunk_id = c.id)
+    INNER JOIN pg_class index_class ON (index_class.relname = ci.index_name)
+    INNER JOIN pg_index i ON (index_class.oid = i.indexrelid AND 
+        i.indrelid = format('%I.%I', c.schema_name, c.table_name)::regclass) 
+    WHERE  ci.hypertable_index_name = hi.name
+    ORDER BY index_class.oid
+    ) INTO index_oids;
+
+    PERFORM _timescaledb_internal.reindex_indexes(index_oids, "verbose", recreate);
+END
+$BODY$;
+

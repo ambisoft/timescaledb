@@ -565,3 +565,67 @@ BEGIN
     END LOOP;
 END
 $BODY$;
+
+
+--documentation of these function located in chunk_index.h
+CREATE OR REPLACE FUNCTION _timescaledb_internal.chunk_index_recreate_create(chunk_index_oid OID) RETURNS OID
+AS '$libdir/timescaledb', 'chunk_index_recreate_create' LANGUAGE C IMMUTABLE STRICT;
+
+CREATE OR REPLACE FUNCTION _timescaledb_internal.chunk_index_recreate_rename(chunk_index_oid_old OID, chunk_index_oid_new OID) RETURNS VOID
+AS '$libdir/timescaledb', 'chunk_index_recreate_rename' LANGUAGE C IMMUTABLE STRICT;
+
+
+CREATE OR REPLACE FUNCTION _timescaledb_internal.reindex_indexes(
+    index_oids OID[],
+    verbose   BOOLEAN = FALSE,
+    recreate  BOOLEAN = FALSE
+)
+    RETURNS VOID LANGUAGE PLPGSQL VOLATILE AS
+$BODY$
+DECLARE
+    new_index_oids OID[];
+    index_oid OID;
+    new_index_oid OID;
+    verbose_mod TEXT = '';
+    index_name NAME;
+    index_schema_name NAME;
+    recreate_state_info RECORD;
+BEGIN
+    FOR index_oid IN SELECT unnest(index_oids)
+    LOOP
+        SELECT c.relname, n.nspname INTO STRICT index_name, index_schema_name
+        FROM pg_class c
+        INNER JOIN pg_namespace n ON (n.OID = c.relnamespace)
+        WHERE c.OID = index_oid;
+
+        IF recreate THEN
+            -- the recreate phase is split into 2 parts a (1) CREATE INDEX followed by  (2) DROP INDEX + RENAME INDEX.
+            -- you want to do phase 1 on all indexes before starting phase 2 since phase 2 takes heavy locks but is quick.
+            SELECT _timescaledb_internal.chunk_index_recreate_create(index_oid)
+            INTO new_index_oid;
+
+            IF "verbose" = true THEN
+                RAISE INFO 'a new index was created for index "%"', index_name;
+            END IF;
+            new_index_oids :=  new_index_oids || new_index_oid;
+        ELSE
+            IF "verbose" THEN
+                verbose_mod := '(VERBOSE)';
+            END IF;
+            EXECUTE FORMAT($$ REINDEX %s INDEX %I.%I $$, verbose_mod, index_schema_name, index_name);
+        END IF;
+    END LOOP;
+
+    IF recreate THEN
+        FOR recreate_state_info IN SELECT unnest(index_oids) AS old_oid,  unnest(new_index_oids) AS new_oid
+        LOOP
+            -- phase 2 of recreate index
+            SELECT relname INTO STRICT index_name FROM pg_class WHERE OID = recreate_state_info.old_oid;
+            PERFORM _timescaledb_internal.chunk_index_recreate_rename(recreate_state_info.old_oid, recreate_state_info.new_oid);
+            IF "verbose" = true THEN
+                RAISE INFO 'index "%" was renamed to use the new index', index_name;
+            END IF;
+        END LOOP;
+    END IF;
+END
+$BODY$;
